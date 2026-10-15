@@ -87,3 +87,16 @@ fn program_status_activity_separate_from_grid_with_fragmented_input() {
     parser.advance(&mut sink, b"\x1b]2;title\x07");
     assert!(parser.take_non_status_activity());
 }
+
+#[test]
+fn fragmented_ordinary_sequences_keep_their_final_wakeup() {
+    for (head, tail) in [(b"\xe4\xb8".as_slice(), b"\xad".as_slice()),
+                         (b"\x1b[", b"2J"), (b"\x1b#", b"8")] {
+        let mut parser = Parser::new();
+        let mut sink = Sink::default();
+        parser.advance(&mut sink, head);
+        parser.take_non_status_activity();
+        parser.advance(&mut sink, tail);
+        assert!(parser.take_non_status_activity());
+    }
+}

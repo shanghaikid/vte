@@ -116,6 +116,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// [`Perform`]: trait.Perform.html
     #[inline]
     pub fn advance<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
+        // A fragmented ordinary escape/UTF-8 sequence may only take effect in
+        // this call, after its introducer's earlier wakeup has been consumed.
+        if self.partial_utf8_len != 0 || !matches!(self.state,
+            State::Ground | State::Escape | State::OscString |
+            State::ProgramStatus | State::ProgramStatusEscape)
+        { self.non_status_activity = true; }
         let mut i = 0;
 
         // Handle partial codepoints from previous calls to `advance`.
@@ -151,6 +157,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         performer: &mut P,
         bytes: &[u8],
     ) -> usize {
+        // A fragmented ordinary escape/UTF-8 sequence may only take effect in
+        // this call, after its introducer's earlier wakeup has been consumed.
+        if self.partial_utf8_len != 0 || !matches!(self.state,
+            State::Ground | State::Escape | State::OscString |
+            State::ProgramStatus | State::ProgramStatusEscape)
+        { self.non_status_activity = true; }
         let mut i = 0;
 
         // Handle partial codepoints from previous calls to `advance`.
