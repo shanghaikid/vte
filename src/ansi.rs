@@ -311,6 +311,11 @@ impl<T: Timeout> Processor<T> {
         }
     }
 
+    /// Whether ordinary terminal output needs a wakeup, excluding OSC 7501.
+    pub fn take_non_status_activity(&mut self) -> bool {
+        self.parser.take_non_status_activity()
+    }
+
     /// End a synchronized update.
     pub fn stop_sync<H>(&mut self, handler: &mut H)
     where
@@ -493,6 +498,12 @@ pub trait Timeout: Default {
 /// XXX Should probably not provide default impls for everything, but it makes
 /// writing specific handler impls for tests far easier.
 pub trait Handler {
+    /// Atomic OSC 7501 report body; streaming size limits are checked by Parser.
+    fn program_status(&mut self, _body: &[u8], _bell_terminated: bool) {}
+
+    /// OSC 133 A: a new shell prompt expires transient program status.
+    fn shell_prompt(&mut self) {}
+
     /// OSC to set window title.
     fn set_title(&mut self, _: Option<String>) {}
 
@@ -1346,6 +1357,12 @@ where
         }
 
         match params[0] {
+            b"7501" if params.len() == 2 => {
+                self.handler.program_status(params[1], bell_terminated);
+            },
+            b"133" if params.get(1) == Some(&b"A".as_slice()) => {
+                self.handler.shell_prompt();
+            },
             // Set window title.
             b"0" | b"2" => {
                 if params.len() >= 2 {

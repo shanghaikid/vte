@@ -64,6 +64,9 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     osc_raw: Vec<u8>,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
+    program_status: bool,
+    osc_discard: bool,
+    non_status_activity: bool,
     ignoring: bool,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
@@ -100,6 +103,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         &self.intermediates[..self.intermediate_idx]
     }
 
+    /// Consume activity requiring the ordinary terminal/UI wakeup.
+    /// OSC 7501 has its own independently coalesced status updates.
+    pub fn take_non_status_activity(&mut self) -> bool {
+        core::mem::take(&mut self.non_status_activity)
+    }
+
     /// Advance the parser state.
     ///
     /// Requires a [`Perform`] implementation to handle the triggered actions.
@@ -117,11 +126,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
-                    self.change_state(performer, byte);
-                    i += 1;
+                    i += self.change_state(performer, byte, &bytes[i..]);
                 },
             }
         }
@@ -152,11 +161,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() && !performer.terminated() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
-                    self.change_state(performer, byte);
-                    i += 1;
+                    i += self.change_state(performer, byte, &bytes[i..]);
                 },
             }
         }
@@ -165,7 +174,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     }
 
     #[inline(always)]
-    fn change_state<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+    fn change_state<P: Perform>(&mut self, performer: &mut P, byte: u8, bytes: &[u8]) -> usize {
         match self.state {
             State::CsiEntry => self.advance_csi_entry(performer, byte),
             State::CsiIgnore => self.advance_csi_ignore(performer, byte),
@@ -179,9 +188,25 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::Escape => self.advance_esc(performer, byte),
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
+            State::ProgramStatus => return self.advance_program_status_slice(performer, bytes),
+            State::ProgramStatusEscape => {
+                if byte == b'\\' {
+                    if self.osc_raw.len() > 4091 {
+                        self.osc_discard = true;
+                    }
+                    self.osc_end(performer, byte);
+                    self.state = State::Ground;
+                } else {
+                    self.osc_raw.clear();
+                    self.reset_params();
+                    self.state = State::Escape;
+                    self.advance_esc(performer, byte);
+                }
+            },
             State::SosPmApcString => self.anywhere(performer, byte),
             State::Ground => unreachable!(),
         }
+        1
     }
 
     #[inline(always)]
@@ -338,6 +363,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     #[inline(always)]
     fn advance_esc<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        if byte != b']' {
+            self.non_status_activity = true;
+        }
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
             0x20..=0x2F => {
@@ -372,6 +400,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x5D => {
                 self.osc_raw.clear();
                 self.osc_num_params = 0;
+                self.program_status = false;
+                self.osc_discard = false;
                 self.state = State::OscString
             },
             0x5E..=0x5F => self.state = State::SosPmApcString,
@@ -428,9 +458,64 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                         return;
                     }
                 }
-                self.action_osc_put_param()
+                self.program_status = self.osc_num_params == 0 && self.osc_raw.as_slice() == b"7501";
+                self.action_osc_put_param();
+                if self.program_status {
+                    self.state = State::ProgramStatus;
+                }
             },
             _ => self.action_osc_put(byte),
+        }
+    }
+
+    /// Copy bounded payload runs in bulk, including when a report spans reads.
+    #[inline]
+    fn advance_program_status_slice<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        let end = memchr::memchr2(0x07, 0x1b, bytes).unwrap_or(bytes.len());
+        let end = memchr::memchr2(0x18, 0x1a, &bytes[..end]).unwrap_or(end);
+        if !self.osc_discard {
+            let remaining = 4092 - self.osc_raw.len();
+            #[cfg(not(feature = "std"))]
+            let remaining = remaining.min(self.osc_raw.remaining_capacity());
+            let count = end.min(remaining);
+            #[cfg(feature = "std")]
+            self.osc_raw.extend_from_slice(&bytes[..count]);
+            #[cfg(not(feature = "std"))]
+            self.osc_raw.try_extend_from_slice(&bytes[..count]).unwrap();
+            if end > remaining { self.osc_discard = true; }
+        }
+        if end < bytes.len() {
+            self.advance_program_status(performer, bytes[end]);
+            end + 1
+        } else { end }
+    }
+
+    // Keep uncommon status parsing out of the instruction cache of CSI/text.
+    #[inline(never)]
+    fn advance_program_status<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x07 => {
+                self.osc_end(performer, byte);
+                self.state = State::Ground;
+            },
+            0x1B => self.state = State::ProgramStatusEscape,
+            0x18 | 0x1A => {
+                self.osc_raw.clear();
+                self.state = State::Ground;
+                performer.execute(byte);
+            },
+            _ => {
+                if self.osc_raw.len() >= 4092 {
+                    self.osc_discard = true;
+                }
+                #[cfg(not(feature = "std"))]
+                if self.osc_raw.is_full() {
+                    self.osc_discard = true;
+                }
+                if !self.osc_discard {
+                    self.action_osc_put(byte);
+                }
+            },
         }
     }
 
@@ -553,7 +638,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
         self.action_osc_put_param();
-        self.osc_dispatch(performer, byte);
+        if !self.program_status {
+            self.non_status_activity = true;
+        }
+        if !self.osc_discard {
+            self.osc_dispatch(performer, byte);
+        }
         self.osc_raw.clear();
         self.osc_num_params = 0;
     }
@@ -606,6 +696,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             return 1;
         }
 
+        self.non_status_activity = true;
         match str::from_utf8(&bytes[..plain_chars]) {
             Ok(parsed) => {
                 Self::ground_dispatch(performer, parsed);
@@ -746,6 +837,8 @@ enum State {
     SosPmApcString,
     #[default]
     Ground,
+    ProgramStatus,
+    ProgramStatusEscape,
 }
 
 /// Performs actions requested by the Parser
@@ -1540,3 +1633,6 @@ mod tests {
         assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x1A));
     }
 }
+
+#[cfg(all(test, feature = "std"))]
+mod program_status_tests;
