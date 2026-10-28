@@ -782,7 +782,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             // If the entire buffer is valid, use the first character and continue parsing.
             Ok(parsed) => {
                 let c = unsafe { parsed.chars().next().unwrap_unchecked() };
-                performer.print(c);
+                Self::ground_dispatch(performer, &parsed[..c.len_utf8()]);
 
                 self.partial_utf8_len = 0;
                 c.len_utf8() - old_bytes
@@ -798,7 +798,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                         parsed.chars().next().unwrap_unchecked()
                     };
 
-                    performer.print(c);
+                    // Use the same C1/control handling as an unsplit UTF-8 run.
+                    let parsed =
+                        unsafe { str::from_utf8_unchecked(&self.partial_utf8[..c.len_utf8()]) };
+                    Self::ground_dispatch(performer, parsed);
 
                     self.partial_utf8_len = 0;
                     return valid_bytes - old_bytes;
@@ -822,10 +825,30 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     /// Handle ground dispatch of print/execute for all characters in a string.
     #[inline]
-    fn ground_dispatch<P: Perform>(performer: &mut P, text: &str) {
-        for c in text.chars() {
+    fn ground_dispatch<P: Perform>(performer: &mut P, mut text: &str) {
+        while !text.is_empty() {
+            let ascii = text
+                .as_bytes()
+                .iter()
+                .position(|b| !(0x20..=0x7E).contains(b))
+                .unwrap_or(text.len());
+            if ascii != 0 {
+                performer.print_ascii(&text.as_bytes()[..ascii]);
+                text = &text[ascii..];
+                continue;
+            }
+            let unicode =
+                text.char_indices().find(|(_, c)| *c <= '\u{9f}').map_or(text.len(), |(i, _)| i);
+            if unicode != 0 {
+                performer.print_unicode(&text[..unicode]);
+                text = &text[unicode..];
+                continue;
+            }
+            let c = text.chars().next().unwrap();
+            text = &text[c.len_utf8()..];
             match c {
                 '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
+                '\x7f' => (),
                 _ => performer.print(c),
             }
         }
@@ -866,6 +889,21 @@ enum State {
 pub trait Perform {
     /// Draw a character to the screen and update states.
     fn print(&mut self, _c: char) {}
+
+    /// Draw a run of printable ASCII (0x20 through 0x7e).
+    /// The default preserves the scalar behavior of existing performers.
+    fn print_ascii(&mut self, text: &[u8]) {
+        for &byte in text {
+            self.print(byte as char);
+        }
+    }
+
+    /// Draw a run of non-ASCII characters excluding C1 controls.
+    fn print_unicode(&mut self, text: &str) {
+        for c in text.chars() {
+            self.print(c);
+        }
+    }
 
     /// Execute a C0 or C1 control function.
     fn execute(&mut self, _byte: u8) {}
@@ -939,6 +977,52 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
+
+    #[test]
+    fn batch_callbacks_preserve_ground_events_at_every_chunk_size() {
+        #[derive(Default)]
+        struct Batched(Dispatcher, usize, usize);
+        impl Perform for Batched {
+            fn print(&mut self, c: char) {
+                self.0.print(c);
+            }
+            fn execute(&mut self, byte: u8) {
+                self.0.execute(byte);
+            }
+            fn print_ascii(&mut self, text: &[u8]) {
+                assert!(!text.is_empty());
+                assert!(text.iter().all(|byte| (0x20..=0x7E).contains(byte)));
+                self.1 += 1;
+                for &byte in text {
+                    self.print(byte as char);
+                }
+            }
+            fn print_unicode(&mut self, text: &str) {
+                assert!(!text.is_empty());
+                assert!(text.chars().all(|c| c > '\u{9f}'));
+                self.2 += 1;
+                for c in text.chars() {
+                    self.print(c);
+                }
+            }
+        }
+        let mut bytes = "abc ~\r\n中文👩‍💻e\u{301}\u{7f}\u{80}\u{9f}終わり".as_bytes().to_vec();
+        bytes.extend_from_slice(&[0xFF, 0xF0, 0x90, b'a', 0xC3, b' ', 0xE2, 0x82, 0xAC]);
+        let mut expected = Dispatcher::default();
+        Parser::new().advance(&mut expected, &bytes);
+        let mut batches = (0, 0);
+        for chunk_size in 1..=bytes.len() {
+            let mut parser = Parser::new();
+            let mut actual = Batched::default();
+            for chunk in bytes.chunks(chunk_size) {
+                parser.advance(&mut actual, chunk);
+            }
+            assert_eq!(actual.0.dispatched, expected.dispatched, "chunk {chunk_size}");
+            batches.0 += actual.1;
+            batches.1 += actual.2;
+        }
+        assert!(batches.0 > 0 && batches.1 > 0);
+    }
 
     const OSC_BYTES: &[u8] = &[
         0x1B, 0x5D, // Begin OSC

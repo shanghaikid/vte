@@ -516,6 +516,20 @@ pub trait Handler {
     /// A character to be displayed.
     fn input(&mut self, _c: char) {}
 
+    /// Display a run of printable ASCII characters.
+    fn input_ascii(&mut self, text: &[u8]) {
+        for &byte in text {
+            self.input(byte as char);
+        }
+    }
+
+    /// Display non-ASCII characters without C1 controls.
+    fn input_unicode(&mut self, text: &str) {
+        for c in text.chars() {
+            self.input(c);
+        }
+    }
+
     /// Set cursor to position.
     fn goto(&mut self, _line: i32, _col: usize) {}
 
@@ -1301,6 +1315,22 @@ where
     fn print(&mut self, c: char) {
         self.handler.input(c);
         self.state.preceding_char = Some(c);
+    }
+
+    #[inline]
+    fn print_ascii(&mut self, text: &[u8]) {
+        self.handler.input_ascii(text);
+        if let Some(&last) = text.last() {
+            self.state.preceding_char = Some(last as char);
+        }
+    }
+
+    #[inline]
+    fn print_unicode(&mut self, text: &str) {
+        self.handler.input_unicode(text);
+        if let Some(last) = text.chars().next_back() {
+            self.state.preceding_char = Some(last);
+        }
     }
 
     #[inline]
